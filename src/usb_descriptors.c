@@ -2,10 +2,8 @@
 #include <stdbool.h>
 #include <math.h>
 
-#include <libopencm3/stm32/gpio.h>
 #include <libopencm3/usb/usbd.h>
 #include <libopencm3/usb/usbstd.h>
-
 
 #include <libopencm3/stm32/desig.h> // For getting device uniq id -> usb serial
 
@@ -35,7 +33,7 @@ const struct usb_device_descriptor dev_descriptor = {
     .bcdDevice          = 0x0100,
     .iManufacturer      = 1,
     .iProduct           = 2,
-    .iSerialNumber      = 3,
+    .iSerialNumber       = 3,
     .bNumConfigurations = 1,
 };
 
@@ -121,8 +119,9 @@ static const struct usb_endpoint_descriptor audio_iso_ep[] = { {
     .bLength          = USB_DT_ENDPOINT_SIZE,
     .bDescriptorType  = USB_DT_ENDPOINT,
     .bEndpointAddress = EP_AUDIO_IN,     /* 0x81 */
+    /* Samples are paced from USB SOF, so this endpoint is synchronous. */
     .bmAttributes     = USB_ENDPOINT_ATTR_ISOCHRONOUS |
-                        USB_ENDPOINT_ATTR_ADAPTIVE,    /* isoc async data */
+                        USB_ENDPOINT_ATTR_SYNC,
     .wMaxPacketSize   = AUDIO_PACKET_SIZE,
     .bInterval        = 1,
     .extra            = audio_cs_ep,
@@ -211,9 +210,7 @@ const struct usb_config_descriptor config_descriptor = {
 /* STRING DESCRIPTORS                                                         */
 /* -------------------------------------------------------------------------- */
 
-/*  Space to populate STM32 uniw ID into as hex */
-#define SERIAL_BUFFER_LEN = 25  /* Max 126 chars */
-
+/* Space to populate STM32 unique ID into as hex. */
 static char usb_serial[25] = "STM32 Unique ID";
 
 const char *usb_strings[] = {
@@ -223,56 +220,67 @@ const char *usb_strings[] = {
 };
 
 /* -------------------------------------------------------------------------- */
-/* STREAMING STATE + SOF-DRIVEN AUDIO                                         */
+/* STREAMING: QUEUE NEXT PACKET AFTER IN TRANSFER COMPLETES                   */
 /* -------------------------------------------------------------------------- */
 
-static volatile bool usb_configured          = false;
 static volatile bool audio_streaming_enabled = false;
-static usbd_device *audio_dev                = NULL;
+static uint32_t audio_phase;
+static volatile uint32_t audio_write_ok;
+static volatile uint32_t audio_write_failed;
 
-/* SOF callback: generate a 1 kHz sine at 48 kHz mono 16-bit */
-static void audio_sof_callback(void)
+static void audio_queue_packet(usbd_device *dev)
 {
-    if (!usb_configured || !audio_streaming_enabled || !audio_dev) {
+    static uint8_t pcm[AUDIO_PACKET_SIZE];
+    uint32_t next_phase = audio_phase;
+    const unsigned sample_count = AUDIO_PACKET_SIZE / AUDIO_BYTES_PER_SAMPLE;
+
+    for (unsigned i = 0; i < sample_count; i++) {
+        float t = 2.0f * (float)M_PI * 1000.0f *
+                  (float)next_phase / (float)AUDIO_SAMPLE_RATE_HZ;
+        int16_t sample = (int16_t)(sinf(t) * 30000.0f);
+
+        pcm[2 * i] = (uint8_t)(sample & 0xff);
+        pcm[2 * i + 1] = (uint8_t)(((uint16_t)sample >> 8) & 0xff);
+
+        next_phase++;
+        if (next_phase == AUDIO_SAMPLE_RATE_HZ) {
+            next_phase = 0;
+        }
+    }
+
+    uint16_t written = usbd_ep_write_packet(dev, EP_AUDIO_IN,
+                                             pcm, AUDIO_PACKET_SIZE);
+    if (written == AUDIO_PACKET_SIZE) {
+        audio_phase = next_phase;
+        audio_write_ok++;
+    } else {
+        audio_write_failed++;
+    }
+}
+
+static void audio_in_complete(usbd_device *dev, uint8_t ep)
+{
+    if (ep == (EP_AUDIO_IN & 0x7f) && audio_streaming_enabled) {
+        audio_queue_packet(dev);
+    }
+}
+
+/* Altsetting callback: prime the first packet; completion callback feeds the
+ * following packets. Do not also queue packets from SOF. */
+static void audio_set_interface(usbd_device *dev, uint16_t iface, uint16_t alt)
+{
+    if (iface != IFACE_AUDIO_STREAM) {
         return;
     }
 
-    static uint16_t phase = 0;
-    static uint8_t  pcm[AUDIO_PACKET_SIZE];
-
-    gpio_set(GPIOA, GPIO0);
-    for (int i = 0; i < AUDIO_PACKET_SIZE /2 ; i++) {
-        /* simple phase -> time in cycles */
-        float t = 2.0f * (float)M_PI * 1000.0f *
-                  (float)phase / (float)AUDIO_SAMPLE_RATE_HZ; /* 1 kHz */
-        float s = sinf(t) * 30000.0f;
-        int16_t sample = (int16_t)s;
-
-//        int16_t sample = 4096;
-        pcm[2 * i + 0] = (uint8_t)(sample & 0xFF);
-        pcm[2 * i + 1] = (uint8_t)((sample >> 8) & 0xFF);
-
-        phase++;
-    }
-
-    gpio_clear(GPIOA, GPIO0);
-	
-
-    if (0 == usbd_ep_write_packet(audio_dev, EP_AUDIO_IN, pcm, AUDIO_PACKET_SIZE ) )
-    gpio_toggle(GPIOC, GPIO13);
-}
-
-/* Altsetting callback: enable/disable streaming */
-static void audio_set_interface(usbd_device *dev, uint16_t iface, uint16_t alt)
-{
-    (void)dev;
-
-    if (iface == IFACE_AUDIO_STREAM) {
-        audio_streaming_enabled = (alt == 1);
+    audio_streaming_enabled = (alt == 1);
+    if (audio_streaming_enabled) {
+        audio_phase = 0;
+        audio_queue_packet(dev);
     }
 }
 
-/* Convert a work to 8 hex chars */
+/* Convert a word to 8 hex chars. */
 static void word_to_hex(uint32_t w, char *dst)
 {
     for (int i = 0; i < 8; i++) {
@@ -282,18 +290,16 @@ static void word_to_hex(uint32_t w, char *dst)
     }
 }
 
-/* Copy STM32 uniqie id into serial localtion  */
-void usb_set_unique_serial() 
+/* Copy STM32 unique ID into serial location. */
+void usb_set_unique_serial(void)
 {
     uint32_t uid[3];
 
-    /* Get pointer to uniq id rehister  from libopencm3*/
-    desig_get_unique_id(uid); 
-    
+    desig_get_unique_id(uid);
+
     word_to_hex(uid[2], &usb_serial[0]);
     word_to_hex(uid[1], &usb_serial[8]);
     word_to_hex(uid[0], &usb_serial[16]);
-
     usb_serial[24] = '\0';
 }
 
@@ -305,17 +311,12 @@ void usb_set_config(usbd_device *usbd_dev, uint16_t wValue)
 {
     (void)wValue;
 
-    audio_dev      = usbd_dev;
-    usb_configured = true;
-
-    /* Configure ISO IN endpoint (alt=1 will actually be used by host) */
+    /* Pass only the transfer type here; sync type belongs in the descriptor. */
     usbd_ep_setup(usbd_dev,
                   EP_AUDIO_IN,
-                  USB_ENDPOINT_ATTR_ISOCHRONOUS | USB_ENDPOINT_ATTR_ASYNC,
+                  USB_ENDPOINT_ATTR_ISOCHRONOUS,
                   AUDIO_PACKET_SIZE,
-                  NULL);
+                  audio_in_complete);
 
-    /* Register callbacks */
     usbd_register_set_altsetting_callback(usbd_dev, audio_set_interface);
-    usbd_register_sof_callback(usbd_dev, audio_sof_callback);
 }

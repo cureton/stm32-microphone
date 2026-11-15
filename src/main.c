@@ -43,6 +43,9 @@ static void gpio_setup(void)
 
     gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO0);
     gpio_clear(GPIOA, GPIO0);
+
+    gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO1);
+    gpio_clear(GPIOA, GPIO1);
 }
 
 /* -------------------------------------------------------------------------- */

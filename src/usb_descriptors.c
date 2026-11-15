@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <math.h>
 
+#include <libopencm3/stm32/gpio.h>
 #include <libopencm3/usb/usbd.h>
 #include <libopencm3/usb/usbstd.h>
 
@@ -9,6 +10,8 @@
 
 #include "usb_audio_uac1.h"
 #include "usb_descriptors.h"
+
+#include "audio_ep_next_frame.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -122,7 +125,7 @@ static const struct usb_endpoint_descriptor audio_iso_ep[] = { {
     /* Samples are paced from USB SOF, so this endpoint is synchronous. */
     .bmAttributes     = USB_ENDPOINT_ATTR_ISOCHRONOUS |
                         USB_ENDPOINT_ATTR_SYNC,
-    .wMaxPacketSize   = AUDIO_PACKET_SIZE,
+    .wMaxPacketSize   = AUDIO_PACKET_SIZE+4,
     .bInterval        = 1,
     .extra            = audio_cs_ep,
     .extralen         = sizeof(audio_cs_ep),
@@ -234,6 +237,7 @@ static void audio_queue_packet(usbd_device *dev)
     uint32_t next_phase = audio_phase;
     const unsigned sample_count = AUDIO_PACKET_SIZE / AUDIO_BYTES_PER_SAMPLE;
 
+    gpio_clear(GPIOC, GPIO13);
     for (unsigned i = 0; i < sample_count; i++) {
         float t = 2.0f * (float)M_PI * 1000.0f *
                   (float)next_phase / (float)AUDIO_SAMPLE_RATE_HZ;
@@ -248,18 +252,28 @@ static void audio_queue_packet(usbd_device *dev)
         }
     }
 
-    uint16_t written = usbd_ep_write_packet(dev, EP_AUDIO_IN,
+    uint16_t written = audio_ep_write_next_frame(dev, EP_AUDIO_IN,
                                              pcm, AUDIO_PACKET_SIZE);
+
     if (written == AUDIO_PACKET_SIZE) {
         audio_phase = next_phase;
         audio_write_ok++;
+	gpio_set(GPIOC, GPIO13);
     } else {
         audio_write_failed++;
     }
 }
 
+/* Called on SOH at 1khz rate */
+static void audio_sof_callback(void) 
+{
+    gpio_toggle(GPIOA, GPIO0);
+}
+
 static void audio_in_complete(usbd_device *dev, uint8_t ep)
 {
+    gpio_toggle(GPIOA, GPIO1);
+
     if (ep == (EP_AUDIO_IN & 0x7f) && audio_streaming_enabled) {
         audio_queue_packet(dev);
     }
@@ -269,6 +283,8 @@ static void audio_in_complete(usbd_device *dev, uint8_t ep)
  * following packets. Do not also queue packets from SOF. */
 static void audio_set_interface(usbd_device *dev, uint16_t iface, uint16_t alt)
 {
+
+
     if (iface != IFACE_AUDIO_STREAM) {
         return;
     }
@@ -319,4 +335,5 @@ void usb_set_config(usbd_device *usbd_dev, uint16_t wValue)
                   audio_in_complete);
 
     usbd_register_set_altsetting_callback(usbd_dev, audio_set_interface);
+    usbd_register_sof_callback(usbd_dev, audio_sof_callback);
 }

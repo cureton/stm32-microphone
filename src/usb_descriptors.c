@@ -123,7 +123,7 @@ static const struct usb_endpoint_descriptor audio_iso_ep[] = { {
     .bEndpointAddress = EP_AUDIO_IN,     /* 0x81 */
     .bmAttributes     = USB_ENDPOINT_ATTR_ISOCHRONOUS |
                         USB_ENDPOINT_ATTR_ADAPTIVE,    /* isoc async data */
-    .wMaxPacketSize   = AUDIO_PACKET_SIZE,             /* 96 bytes */
+    .wMaxPacketSize   = AUDIO_PACKET_SIZE,
     .bInterval        = 1,
     .extra            = audio_cs_ep,
     .extralen         = sizeof(audio_cs_ep),
@@ -241,23 +241,25 @@ static void audio_sof_callback(void)
     static uint8_t  pcm[AUDIO_PACKET_SIZE];
 
     gpio_set(GPIOA, GPIO0);
-    for (int i = 0; i < AUDIO_PACKET_SIZE / 2; i++) {
+    for (int i = 0; i < AUDIO_PACKET_SIZE /2 ; i++) {
         /* simple phase -> time in cycles */
-//g        float t = 2.0f * (float)M_PI * 1000.0f *
-//g                  (float)phase / (float)AUDIO_SAMPLE_RATE_HZ; /* 1 kHz */
-//g        float s = sinf(t) * 30000.0f;
-//g        int16_t sample = (int16_t)s;
-//g
-        int16_t sample = 4096;
+        float t = 2.0f * (float)M_PI * 1000.0f *
+                  (float)phase / (float)AUDIO_SAMPLE_RATE_HZ; /* 1 kHz */
+        float s = sinf(t) * 30000.0f;
+        int16_t sample = (int16_t)s;
+
+//        int16_t sample = 4096;
         pcm[2 * i + 0] = (uint8_t)(sample & 0xFF);
         pcm[2 * i + 1] = (uint8_t)((sample >> 8) & 0xFF);
 
- //       phase++;
-        gpio_clear(GPIOA, GPIO0);
-
+        phase++;
     }
 
-    (void)usbd_ep_write_packet(audio_dev, EP_AUDIO_IN, pcm, AUDIO_PACKET_SIZE);
+    gpio_clear(GPIOA, GPIO0);
+	
+
+    if (0 == usbd_ep_write_packet(audio_dev, EP_AUDIO_IN, pcm, AUDIO_PACKET_SIZE ) )
+    gpio_toggle(GPIOC, GPIO13);
 }
 
 /* Altsetting callback: enable/disable streaming */

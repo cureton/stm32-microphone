@@ -105,7 +105,7 @@
 /* -------------------------------------------------------------------------- */
 
 /* 48 kHz / mono / 16-bit mic */
-#define AUDIO_SAMPLE_RATE_HZ        48000
+#define AUDIO_SAMPLE_RATE_HZ        8000
 #define AUDIO_NUM_CHANNELS          1
 #define AUDIO_BITS_PER_SAMPLE       16
 #define AUDIO_BYTES_PER_SAMPLE      (AUDIO_BITS_PER_SAMPLE / 8)
